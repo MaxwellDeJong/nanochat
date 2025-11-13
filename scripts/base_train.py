@@ -18,16 +18,26 @@ from contextlib import nullcontext
 
 import wandb
 import torch
+import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint
+from nanochat.checkpoint_manager import save_checkpoint, load_latest_checkpoint, save_latest_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from scripts.base_eval import evaluate_model
 print_banner()
+
+def get_rng_state(device_type):
+    # Get the random number generator state
+    rng_state = {
+        'cpu_rng_state': torch.get_rng_state().tolist(),
+    }
+    if device_type == 'cuda':
+        rng_state['cuda_rng_state'] = torch.cuda.get_rng_state().tolist()
+    return rng_state
 
 # -----------------------------------------------------------------------------
 # User settings
@@ -60,6 +70,9 @@ core_metric_max_per_task = 500 # examples per task in estimating the core metric
 sample_every = 2000 # every how many steps to sample from the model
 # Output
 model_tag = "" # optionally override the model tag for the output checkpoint directory name
+# Checkpointing
+resume = False # resume training from a checkpoint?
+checkpoint_every = 250 # save a checkpoint every this many steps (-1 disables)
 # now allow CLI to override the settings via the configurator lol
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
@@ -148,6 +161,63 @@ base_dir = get_base_dir()
 tokens_dir = os.path.join(base_dir, "tokenized_data")
 train_loader = tokenizing_distributed_data_loader(device_batch_size, max_seq_len, split="train", device=device)
 build_val_loader = lambda: tokenizing_distributed_data_loader(device_batch_size, max_seq_len, split="val", device=device)
+
+start_step = 0
+if resume:
+    output_dirname = model_tag if model_tag else f"d{depth}"
+    checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+    latest_checkpoint_path = os.path.join(checkpoint_dir, "model_latest.pt")
+    if os.path.exists(latest_checkpoint_path):
+        if master_process:
+            try:
+                print0(f"Found latest checkpoint, resuming training.")
+                model_data, optimizer_data, meta_data = load_latest_checkpoint(checkpoint_dir, device, load_optimizer=True)
+                # fix torch compile issue, which prepends all keys with _orig_mod.
+                model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
+                orig_model.load_state_dict(model_data, strict=True)
+                for opt, opt_data in zip(optimizers, optimizer_data):
+                    opt.load_state_dict(opt_data)
+                start_step = meta_data['step'] + 1
+                if 'min_val_bpb' in meta_data:
+                    min_val_bpb = meta_data['min_val_bpb']
+                if 'smooth_train_loss' in meta_data:
+                    smooth_train_loss = meta_data['smooth_train_loss']
+                if 'ema_steps' in meta_data:
+                    ema_steps = meta_data['ema_steps']
+                else:
+                    # Fallback: if ema_steps not saved, infer from the saved step
+                    # The checkpoint was saved at meta_data['step'], and ema_steps reflects
+                    # the number of EMA updates completed up to that point
+                    ema_steps = meta_data['step']
+                if 'rng_state' in meta_data:
+                    rng_state = meta_data['rng_state']
+                    # convert lists back to tensors
+                    cpu_rng_tensor = torch.tensor(rng_state['cpu_rng_state'], dtype=torch.uint8)
+                    torch.set_rng_state(cpu_rng_tensor)
+                    if device_type == 'cuda' and 'cuda_rng_state' in rng_state:
+                        cuda_rng_tensor = torch.tensor(rng_state['cuda_rng_state'], dtype=torch.uint8)
+                        torch.cuda.set_rng_state(cuda_rng_tensor)
+            except FileNotFoundError:
+                print0(f"Resume is true but latest checkpoint is incomplete in {checkpoint_dir}, starting from scratch.")
+        # broadcast start_step from master to other ranks
+        if ddp:
+            start_step_tensor = torch.tensor(start_step, dtype=torch.long, device=device)
+            dist.broadcast(start_step_tensor, src=0)
+            start_step = start_step_tensor.item()
+    else:
+        if master_process:
+            print0(f"Resume is true but no latest checkpoint found in {checkpoint_dir}, starting from scratch.")
+
+# Fast-forward the dataloader if resuming
+if resume and start_step > 0:
+    num_batches_to_skip = (start_step - 1) * grad_accum_steps
+    if master_process:
+        print0(f"Fast-forwarding dataloader by {num_batches_to_skip} batches...")
+    for i in range(num_batches_to_skip):
+        next(train_loader)
+    if master_process:
+        print0("Dataloader fast-forward complete.")
+
 x, y = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
@@ -175,10 +245,11 @@ def get_muon_momentum(it):
 # Training loop
 min_val_bpb = float("inf")
 smooth_train_loss = 0 # EMA of training loss
+ema_steps = 0 # number of steps that have contributed to the EMA
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
 # note that we run +1 steps only so that we can eval and save at the end
-for step in range(num_iterations + 1):
+for step in range(start_step, num_iterations + 1):
     last_step = step == num_iterations
     flops_so_far = num_flops_per_token * total_batch_size * step
 
@@ -237,24 +308,50 @@ for step in range(num_iterations + 1):
             print0(tokenizer.decode(sample[0]))
         model.train()
 
-    # save checkpoint at the end of the run (only on master process)
-    if master_process and last_step:
+    # save checkpoint periodically and at the end of the run (only on master process)
+    if master_process:
         output_dirname = model_tag if model_tag else f"d{depth}" # e.g. d12
         checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
-        save_checkpoint(
-            checkpoint_dir,
-            step,
-            orig_model.state_dict(),
-            [opt.state_dict() for opt in optimizers], # TODO: make sure saving across ranks is done correctly
-            {
-                "step": step,
-                "val_bpb": val_bpb, # loss at last step
-                "model_config": model_config_kwargs,
-                "user_config": user_config, # inputs to the training script
-                "device_batch_size": device_batch_size,
-                "max_seq_len": max_seq_len,
-            }
-        )
+        # 1. save a permanent, step-numbered checkpoint at the very end of the run
+        if last_step:
+            save_checkpoint(
+                checkpoint_dir,
+                step,
+                orig_model.state_dict(),
+                [opt.state_dict() for opt in optimizers],
+                {
+                    "step": step,
+                    "val_bpb": val_bpb, # loss at last step
+                    "min_val_bpb": min_val_bpb,
+                    "smooth_train_loss": smooth_train_loss,
+                    "ema_steps": ema_steps,
+                    "rng_state": get_rng_state(device_type),
+                    "model_config": model_config_kwargs,
+                    "user_config": user_config, # inputs to the training script
+                    "device_batch_size": device_batch_size,
+                    "max_seq_len": max_seq_len,
+                }
+            )
+        # 2. save a temporary, overwriting latest checkpoint for easy resume
+        elif checkpoint_every != -1 and step > 0 and step % checkpoint_every == 0:
+            save_latest_checkpoint(
+                checkpoint_dir,
+                step,
+                orig_model.state_dict(),
+                [opt.state_dict() for opt in optimizers],
+                {
+                    "step": step,
+                    "val_bpb": val_bpb, # loss at last step
+                    "min_val_bpb": min_val_bpb,
+                    "smooth_train_loss": smooth_train_loss,
+                    "ema_steps": ema_steps,
+                    "rng_state": get_rng_state(device_type),
+                    "model_config": model_config_kwargs,
+                    "user_config": user_config, # inputs to the training script
+                    "device_batch_size": device_batch_size,
+                    "max_seq_len": max_seq_len,
+                }
+            )
 
     if last_step:
         break
@@ -271,11 +368,9 @@ for step in range(num_iterations + 1):
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
         x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-    # gradient clipping
-    grad_clip_enabled = grad_clip > 0.0
-    if grad_clip_enabled:
-        grad_norm_tensor = torch.nn.utils.clip_grad_norm_(orig_model.parameters(), grad_clip)
-        grad_norm = grad_norm_tensor.item() # GPU tensor -> CPU float (note: cpu-gpu sync point)
+    # gradient clipping (TODO possibly experiment with)
+    if grad_clip > 0.0:
+        torch.nn.utils.clip_grad_norm_(orig_model.parameters(), grad_clip)
     # step the optimizers
     lrm = get_lr_multiplier(step)
     for opt in optimizers:
@@ -294,7 +389,8 @@ for step in range(num_iterations + 1):
 
     # logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
+    ema_steps += 1 # increment the number of steps that have contributed to the EMA
+    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**ema_steps) # debias the EMA
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
@@ -302,10 +398,9 @@ for step in range(num_iterations + 1):
     mfu = 100 * flops_per_sec / promised_flops_per_sec_h100 # in %
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
-    print_grad_norm = f" grad norm: {grad_norm:.4f} |" if grad_clip_enabled else ""
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
     if step % 100 == 0:
-        log_data = {
+        wandb_run.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
@@ -314,10 +409,7 @@ for step in range(num_iterations + 1):
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
-        }
-        if grad_clip_enabled:
-            log_data["train/grad_norm"] = grad_norm
-        wandb_run.log(log_data)
+        })
 
 # print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
@@ -353,3 +445,4 @@ get_report().log(section="Base model training", data=[
 # cleanup
 wandb_run.finish() # wandb run finish
 compute_cleanup()
+

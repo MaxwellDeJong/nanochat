@@ -1,0 +1,23 @@
+services:
+  training:
+    build: .
+    command: bash speedrun.sh --resume
+    ipc: "host"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    volumes:
+      - nanochat_cache:/root/.cache/nanochat
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ports:
+      - 8000:8000
+
+volumes:
+  nanochat_cache:
+

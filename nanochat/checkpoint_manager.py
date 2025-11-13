@@ -34,9 +34,27 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data)
         log0(f"Saved optimizer file to: {optimizer_path}")
     # Save the metadata dict as json
     meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
-    with open(meta_path, "w", encoding="utf-8") as f:
+    with open(meta_path, "w") as f:
         json.dump(meta_data, f, indent=2)
     log0(f"Saved metadata file to: {meta_path}")
+
+def save_latest_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data):
+    assert int(os.environ.get('RANK', 0)) == 0
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    # Save the model state
+    model_path = os.path.join(checkpoint_dir, "model_latest.pt")
+    torch.save(model_data, model_path)
+    log0(f"Saved latest model file to: {model_path}")
+    # Save the optimizer state
+    if optimizer_data is not None:
+        optimizer_path = os.path.join(checkpoint_dir, "optim_latest.pt")
+        torch.save(optimizer_data, optimizer_path)
+        log0(f"Saved latest optimizer file to: {optimizer_path}")
+    # Save the metadata
+    meta_path = os.path.join(checkpoint_dir, "meta_latest.json")
+    with open(meta_path, "w") as f:
+        json.dump(meta_data, f, indent=2)
+    log0(f"Saved latest metadata file to: {meta_path}")
 
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False):
@@ -50,7 +68,22 @@ def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False):
         optimizer_data = torch.load(optimizer_path, map_location=device)
     # Load the metadata
     meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
-    with open(meta_path, "r", encoding="utf-8") as f:
+    with open(meta_path, "r") as f:
+        meta_data = json.load(f)
+    return model_data, optimizer_data, meta_data
+
+def load_latest_checkpoint(checkpoint_dir, device, load_optimizer=False):
+    # Load the model state
+    model_path = os.path.join(checkpoint_dir, "model_latest.pt")
+    model_data = torch.load(model_path, map_location=device)
+    # Load the optimizer state if requested
+    optimizer_data = None
+    if load_optimizer:
+        optimizer_path = os.path.join(checkpoint_dir, "optim_latest.pt")
+        optimizer_data = torch.load(optimizer_path, map_location=device)
+    # Load the metadata
+    meta_path = os.path.join(checkpoint_dir, "meta_latest.json")
+    with open(meta_path, "r") as f:
         meta_data = json.load(f)
     return model_data, optimizer_data, meta_data
 
@@ -65,7 +98,7 @@ def build_model(checkpoint_dir, step, device, phase):
     """
     assert phase in ["train", "eval"], f"Invalid phase: {phase}"
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, step, device, load_optimizer=False)
-    if device.type in {"cpu", "mps"}:
+    if device.type == "cpu":
         # Convert bfloat16 tensors to float for CPU inference
         model_data = {
             k: v.float() if v.dtype == torch.bfloat16 else v
@@ -119,7 +152,10 @@ def find_last_step(checkpoint_dir):
     checkpoint_files = glob.glob(os.path.join(checkpoint_dir, "model_*.pt"))
     if not checkpoint_files:
         raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
-    last_step = int(max(os.path.basename(f).split("_")[-1].split(".")[0] for f in checkpoint_files))
+    final_checkpoint_files = [f for f in checkpoint_files if "latest" not in f]
+    if not final_checkpoint_files:
+        return None
+    last_step = int(max(os.path.basename(f).split("_")[-1].split(".")[0] for f in final_checkpoint_files))
     return last_step
 
 # -----------------------------------------------------------------------------
@@ -128,7 +164,8 @@ def find_last_step(checkpoint_dir):
 def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=None):
     if model_tag is None:
         # guess the model tag by defaulting to the largest model
-        model_tag = find_largest_model(checkpoints_dir)
+        #model_tag = find_largest_model(checkpoints_dir)
+        model_tag = 'd8'
         log0(f"No model tag provided, guessing model tag: {model_tag}")
     checkpoint_dir = os.path.join(checkpoints_dir, model_tag)
     if step is None:
@@ -150,3 +187,4 @@ def load_model(source, *args, **kwargs):
     base_dir = get_base_dir()
     checkpoints_dir = os.path.join(base_dir, model_dir)
     return load_model_from_dir(checkpoints_dir, *args, **kwargs)
+

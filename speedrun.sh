@@ -18,12 +18,6 @@ mkdir -p $NANOCHAT_BASE_DIR
 # -----------------------------------------------------------------------------
 # Python venv setup with uv
 
-# install uv (if not already installed)
-command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
-# create a .venv local virtual environment (if it doesn't exist)
-[ -d ".venv" ] || uv venv
-# install the repo dependencies
-uv sync --extra gpu
 # activate venv so that `python` uses the project's venv instead of system python
 source .venv/bin/activate
 
@@ -48,12 +42,7 @@ python -m nanochat.report reset
 # -----------------------------------------------------------------------------
 # Tokenizer
 
-# Install Rust / Cargo
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
-
-# Build the rustbpe Tokenizer
-uv run maturin develop --release --manifest-path rustbpe/Cargo.toml
 
 # Download the first ~2B characters of pretraining dataset
 # look at dev/repackage_data_reference.py for details on how this data was prepared
@@ -66,9 +55,14 @@ python -m nanochat.dataset -n 8
 python -m nanochat.dataset -n 240 &
 DATASET_DOWNLOAD_PID=$!
 # train the tokenizer with vocab size 2**16 = 65536 on ~2B characters of data
-python -m scripts.tok_train --max_chars=2000000000
-# evaluate the tokenizer (report compression ratio etc.)
-python -m scripts.tok_eval
+if [ ! -f "$NANOCHAT_BASE_DIR/tokenizer/tokenizer.pkl" ] || [ ! -f "$NANOCHAT_BASE_DIR/tokenizer/token_bytes.pt" ]; then
+    echo "Training tokenizer..."
+    python -m scripts.tok_train --max_chars=2000000000
+    # evaluate the tokenizer (report compression ratio etc.)
+    python -m scripts.tok_eval
+else
+    echo "Tokenizer already trained, skipping training."
+fi
 
 # -----------------------------------------------------------------------------
 # Base model (pretraining)
@@ -82,50 +76,52 @@ python -m scripts.tok_eval
 echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
-# Number of processes/GPUs to use
-NPROC_PER_NODE=8
+RESUME_FLAG=""
+if [ "$1" == "--resume" ]; then
+    RESUME_FLAG="--resume=True"
+fi
 
 # pretrain the d20 model
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --run=$WANDB_RUN
+torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- --depth=16 --run=$WANDB_RUN --device_batch_size=8 $RESUME_FLAG
 # evaluate the model on a larger chunk of train/val data and draw some samples
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss
+#torchrun --standalone --nproc_per_node=1 -m scripts.base_loss --device_batch_size=16
 # evaluate the model on CORE tasks
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval
+#torchrun --standalone --nproc_per_node=1 -m scripts.base_eval
 
 # -----------------------------------------------------------------------------
 # Midtraining (teach the model conversation special tokens, tool use, multiple choice)
 
 # download 2.3MB of synthetic identity conversations to impart a personality to nanochat
 # see dev/gen_sft_data.py for details on how this data was prepared and to get a sense of how you can easily tune it
-curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
+#curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
 
 # run midtraining and eval the model
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.mid_train -- --run=$WANDB_RUN
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i mid
+#torchrun --standalone --nproc_per_node=1 -m scripts.mid_train -- --run=$WANDB_RUN --device_batch_size=16
+#torchrun --standalone --nproc_per_node=1 -m scripts.chat_eval -- -i mid --device_batch_size=16
 
 # -----------------------------------------------------------------------------
 # Supervised Finetuning (domain adaptation to each sequence all by itself per row)
 
 # train sft and re-eval right away (should see a small bump)
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_sft -- --run=$WANDB_RUN
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i sft
+#torchrun --standalone --nproc_per_node=1 -m scripts.chat_sft -- --run=$WANDB_RUN --device_batch_size=8
+#torchrun --standalone --nproc_per_node=1 -m scripts.chat_eval -- -i sft -b 8
 
 # chat with the model over CLI! Leave out the -p to chat interactively
 # python -m scripts.chat_cli -p "Why is the sky blue?"
 
 # even better, chat with your model over a pretty WebUI ChatGPT style
-# python -m scripts.chat_web
+#python -m scripts.chat_web
 
 # -----------------------------------------------------------------------------
 # Reinforcement Learning. Optional, and currently only on GSM8K
 # (optional)
 
 # run reinforcement learning
-# torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_rl -- --run=$WANDB_RUN
+# torchrun --standalone --nproc_per_node=1 -m scripts.chat_rl -- --run=$WANDB_RUN
 # eval the RL model only on GSM8K
-# torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i rl -a GSM8K
+# torchrun --standalone --nproc_per_node=1 -m scripts.chat_eval -- -i rl -a GSM8K
 
 # -----------------------------------------------------------------------------
 # Generate the full report by putting together all the sections
 # report.md is the output and will be copied to current directory for convenience
-python -m nanochat.report generate
+#python -m nanochat.report generate
